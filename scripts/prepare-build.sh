@@ -13,8 +13,10 @@
 #   DEVICE        device id (selects devices/<device>/)
 #
 # Optional env:
-#   FEEDS         newline-separated `src-git <name> <url>` lines to append to feeds.conf
+#   FEEDS         newline-separated `src-git <name> <url>` lines for feeds.conf;
+#                 a name already in feeds.conf replaces that feed (fork stand-in)
 #   CONFIG_FRAGMENT  repo-relative .config fragment appended last (flavour, e.g. mesh)
+#   COMMON        devices/<COMMON> holding the shared config and overlays (default: common)
 
 set -euo pipefail
 
@@ -28,7 +30,7 @@ source "$(dirname -- "$0")/lib/log.sh"
 
 FEEDS="${FEEDS:-}"
 CONFIG_FRAGMENT="${CONFIG_FRAGMENT:-}"
-COMMON_DIR="$BUILDER_REPO/devices/common"
+COMMON_DIR="$BUILDER_REPO/devices/${COMMON:-common}"
 DEVICE_DIR="$BUILDER_REPO/devices/$DEVICE"
 
 [[ -f "$DEVICE_DIR/config" ]] || log::die "$DEVICE_DIR/config not found"
@@ -55,9 +57,14 @@ if [[ -n "$FEEDS" ]]; then
     # Idempotent: this script is re-run over an existing tree, and a plain
     # append duplicates every custom feed on each pass - which then makes
     # `feeds update` fetch the same feed repeatedly under one name.
-    grep -qxF "$line" feeds.conf || echo "$line" >>feeds.conf
-    # Update + install each custom feed individually so failures are obvious.
     feed_name="$(awk '{print $2}' <<<"$line")"
+    if ! grep -qxF "$line" feeds.conf; then
+      # Same name as an existing feed: the line replaces it, so a fork can
+      # stand in for a default feed.
+      sed -i -E "/^src-\S+[[:space:]]+${feed_name}[[:space:]]/d" feeds.conf
+      echo "$line" >>feeds.conf
+    fi
+    # Update + install each custom feed individually so failures are obvious.
     log::info "Updating feed: $feed_name"
     ./scripts/feeds update "$feed_name"
     ./scripts/feeds install -a -p "$feed_name"
@@ -68,11 +75,11 @@ log::info "Updating + installing all feeds"
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
-# 1b. Apply local patches to feed packages (patches/feeds/<feed>/*.patch, paths
-#     relative to the feed root). Currently only the NSS DSCP column on the
-#     built-in Status -> Realtime -> Connections page.
+# 1b. Apply local patches to feed packages
+#     (patches/feeds/<variant>/<feed>/*.patch, paths relative to the feed
+#     root), so a patch rides only the flavour it is for.
 shopt -s nullglob
-for p in "$BUILDER_REPO"/patches/feeds/*/*.patch; do
+for p in "$BUILDER_REPO/patches/feeds/$VARIANT"/*/*.patch; do
   feed="feeds/$(basename "$(dirname "$p")")"
   if patch -p1 -d "$feed" --dry-run --forward <"$p" >/dev/null 2>&1; then
     log::info "Patching $feed with $(basename "$p")"
@@ -118,6 +125,8 @@ if [[ -n "$FEEDS" ]]; then
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     feed_name="$(awk '{print $2}' <<<"$line")"
+    # A fork standing in for a default feed keeps that feed's distfeed entry.
+    grep -qE "^src-\S+[[:space:]]+${feed_name}[[:space:]]" feeds.conf.default && continue
     sed -i "s/^CONFIG_FEED_${feed_name}=.*/# CONFIG_FEED_${feed_name} is not set/" .config || true
   done <<<"$FEEDS"
 fi
